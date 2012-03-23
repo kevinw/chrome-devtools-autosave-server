@@ -1,14 +1,130 @@
 'use strict';
 
+var WATCH_POLL_INTERVAL = 100;
+
+var extensions = "js|css";
+extensions = extensions.replace(/,/g, "|");
+var fileExtensionPattern = new RegExp("^.*\.(" + extensions + ")$");
+
+var fs = require('fs'),
+    path = require('path');
+
+var diff_match_patch = require('./diff_match_patch').diff_match_patch;
+var diffMatchPatch = new diff_match_patch();
+
+var regex = function(s) { return new RegExp('^' + s); };
+
 var routes = [
     {
-        from: /^file:\/\/[^/]*\//,
-        to: '/'
+        from: 'http://localhost:8989/',
+        to: '/Users/kevin/src/testlive/'
     }
 ];
+
+function pathToUrl(path) {
+    var matches;
+    for (var i = 0; i < routes.length; i++) {
+        var route = routes[i];
+        if (regex(route.to).test(path)) {
+            matches = true;
+            break;
+        }
+    }
+
+    if (!matches) {
+        if (i === 1) {
+            throw path + ' doesn’t match a route ' + route.to;
+        } else {
+            throw (path + ' doesn’t match any of the following routes:\n' + routes.map(function(a) {
+                return a.to;
+            }).join('\n'));
+        }
+        return;
+    }
+
+    return path.replace(regex(route.to), route.from);
+}
+
+var watches = {
+    files: '/Users/kevin/src/testlive/'
+};
+
 var port = 9104;
+var socketPort = 9105;
 var address = '127.0.0.1';
 var version = versionTriple('1.0.0');
+
+var resourceMap = {};
+
+function startSocketServer() {
+    var io = require('socket.io').listen(socketPort);
+
+    var dir = watches.files;
+
+    fs.readdir(dir, function(err, list) {
+        if (err) throw err;
+        list.forEach(function(file) {
+            if (file.match(/.[js|css]$/)) {
+                var resourcePath = path.normalize(dir + '/' + file);
+                fs.readFile(resourcePath, function(err, data) {
+                    if (err) throw err;
+                    resourceMap[resourcePath] = data.toString('utf8');
+                });
+            }
+        });
+    });
+
+    var connectedSockets = [];
+
+    findAllWatchFiles(watches.files, function(f) {
+        f = path.normalize(f);
+        var first = true;
+        fs.watchFile(f, {persistent: true, interval: WATCH_POLL_INTERVAL}, function(curr, prev) {
+            if (first) {
+                first = false;
+                return;
+            }
+            if (curr.mtime !== prev.mtime)
+                onFileChange(f);
+        });
+    });
+
+    function onFileChange(resourcePath) {
+        if (!resourceMap[resourcePath])
+            return;
+
+        var oldContents = resourceMap[resourcePath];
+        fs.readFile(resourcePath, function(err, data) {
+            if (err) throw data;
+
+            var newContents = data.toString('utf8');
+            if (newContents === oldContents) return;
+
+            resourceMap[resourcePath] = newContents;
+
+            if (!connectedSockets.length) return;
+
+            console.log('CHANGED', resourcePath);
+
+            var patch = diffMatchPatch.patch_make(oldContents, newContents);
+            connectedSockets.forEach(function(socket) {
+                var url = pathToUrl(resourcePath);
+                socket.emit('fileChanged', {
+                    url: url,
+                    patch: patch
+                });
+            });
+        });
+    }
+
+    io.sockets.on('connection', function (socket) {
+        connectedSockets.push(socket);
+        socket.on('disconnect', function() {
+            var idx = connectedSockets.indexOf(socket);
+            if (idx !== -1) connectedSockets.splice(idx, 1);
+        });
+    });
+}
 
 /**
  * @param {string} version
@@ -19,7 +135,7 @@ function versionTriple(version) {
     var triple;
     if (version) {
         triple = version.split('.').map(function(x) {
-            return parseInt(x);
+            return parseInt(x, 10);
         });
     } else {
         triple = [0, 0, 0];
@@ -37,9 +153,7 @@ function versionTriple(version) {
  */
 function start(routes, port, address) {
 
-    var fs = require('fs');
-    var diff_match_patch = require('./diff_match_patch').diff_match_patch;
-    var diffMatchPatch = new diff_match_patch();
+    startSocketServer();
 
     require('http').createServer(function(request, response) {
 
@@ -65,27 +179,31 @@ function start(routes, port, address) {
             return;
         }
 
-        var matches;
-        for (var i = 0; i < routes.length; i++) {
-            var route = routes[i];
-            if (route.from.test(url)) {
-                matches = true;
-                break;
+        function urlToPath(url) {
+            var matches;
+            for (var i = 0; i < routes.length; i++) {
+                var route = routes[i];
+                if (regex(route.from).test(url)) {
+                    matches = true;
+                    break;
+                }
             }
+
+            if (!matches) {
+                if (i === 1) {
+                    internalServerError(url + ' doesn’t match a route ' + route.from);
+                } else {
+                    internalServerError(url + ' doesn’t match any of the following routes:\n' + routes.map(function(a) {
+                        return a.from;
+                    }).join('\n'));
+                }
+                return;
+            }
+
+            return url.replace(regex(route.from), route.to);
         }
 
-        if (!matches) {
-            if (i === 1) {
-                internalServerError(url + ' doesn’t match a route ' + route.from);
-            } else {
-                internalServerError(url + ' doesn’t match any of the following routes:\n' + routes.map(function(a) {
-                    return a.from;
-                }).join('\n'));
-            }
-            return;
-        }
-
-        var path = url.replace(route.from, route.to);
+        var path = urlToPath(url);
 
         if (/\/[C-Z]:\//.test(path)) {
             // Oh, Windows.
@@ -183,6 +301,31 @@ function info(text) {
 function error(text) {
     process.stdout.write('\x1B[31m' + text + '\x1B[0m\n');
 }
+
+var findAllWatchFiles = function(path, callback) {
+  fs.stat(path, function(err, stats){
+    if (err) {
+      console.error('Error retrieving stats for file: ' + path);
+    } else {
+      if (stats.isDirectory()) {
+        fs.readdir(path, function(err, fileNames) {
+          if(err) {
+            util.error('Error reading path: ' + path);
+          }
+          else {
+            fileNames.forEach(function (fileName) {
+              findAllWatchFiles(path + '/' + fileName, callback);
+            });
+          }
+        });
+      } else {
+        if (path.match(fileExtensionPattern)) {
+          callback(path);
+        }
+      }
+    }
+  });
+};
 
 if (module.parent) {
     // Loaded via module, i.e. require('index.js')
